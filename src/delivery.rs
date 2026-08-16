@@ -1117,6 +1117,16 @@ const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(2000);
 /// True when Grok has actually started a user turn (UPS / stop cycle), not when
 /// we merely acked the bus. `deliver:*` is our own premature-ack context and
 /// must NOT count as submit.
+/// True when we already submitted a wake for this unread batch and must wait
+/// for grok-stop to ack instead of typing another `hcom: wake`.
+fn grok_should_skip_rewake(
+    awaiting_at: Option<i64>,
+    current_cursor: i64,
+    has_pending: bool,
+) -> bool {
+    has_pending && awaiting_at == Some(current_cursor)
+}
+
 fn grok_turn_started(status: &str, context: &str) -> bool {
     if status != ST_ACTIVE && status != "active" {
         // Allow any non-listening non-active that clearly means mid-turn tools.
@@ -1461,6 +1471,11 @@ pub fn run_delivery_loop(
         let mut injected_text = String::new();
         let mut phase_started_at = Instant::now();
         let mut cursor_before: i64 = 0;
+        // After a Grok wake sentinel is submitted, Stop owns the pending batch.
+        // Remember the delivery cursor so Idle/notify does not re-type `hcom: wake`
+        // when Stop flips listening (same batch still unread until additionalContext
+        // is flushed). Cleared when pending drains or the cursor advances.
+        let mut grok_awaiting_stop_at: Option<i64> = None;
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
@@ -1551,7 +1566,26 @@ pub fn run_delivery_loop(
 
                     // Check for pending messages
                     let has_pending = db.has_pending(&current_name);
-                    if has_pending {
+                    if !has_pending {
+                        grok_awaiting_stop_at = None;
+                    }
+                    if has_pending
+                        && config.tool == "grok"
+                        && grok_should_skip_rewake(
+                            grok_awaiting_stop_at,
+                            db.get_cursor(&current_name),
+                            has_pending,
+                        )
+                    {
+                        log_info(
+                            "native",
+                            "delivery.grok_await_stop",
+                            &format!(
+                                "Already woke this pending batch (cursor={}); waiting for Stop additionalContext",
+                                db.get_cursor(&current_name)
+                            ),
+                        );
+                    } else if has_pending {
                         log_info(
                             "native",
                             "delivery.wake",
@@ -1582,6 +1616,7 @@ pub fn run_delivery_loop(
                             "delivery.no_pending",
                             &format!("No pending messages for {}", current_name),
                         );
+                        grok_awaiting_stop_at = None;
                         delivery_state = State::Idle;
                         attempt = 0;
                         continue;
@@ -1840,8 +1875,14 @@ pub fn run_delivery_loop(
                                 );
                                 inject_attempt = 0;
                                 attempt = 0;
-                                // If still pending, Stop will deliver body. Stay idle
-                                // until notify after Stop; then Pending wakes again.
+                                // If still pending, Stop will deliver the body. Do not
+                                // re-inject when Stop notifies + sets listening — that
+                                // notify is for the same unread batch.
+                                if still_pending {
+                                    grok_awaiting_stop_at = Some(db.get_cursor(&current_name));
+                                } else {
+                                    grok_awaiting_stop_at = None;
+                                }
                                 delivery_state = State::Idle;
                                 phase_started_at = Instant::now();
                                 continue;
@@ -2635,6 +2676,14 @@ mod tests {
     #[test]
     fn grok_wake_trigger_has_no_angle_brackets() {
         assert!(!GROK_WAKE_TRIGGER.contains('<'));
+    }
+
+    #[test]
+    fn grok_skips_rewake_until_stop_advances_cursor() {
+        assert!(grok_should_skip_rewake(Some(42), 42, true));
+        assert!(!grok_should_skip_rewake(Some(42), 99, true));
+        assert!(!grok_should_skip_rewake(Some(42), 42, false));
+        assert!(!grok_should_skip_rewake(None, 42, true));
         assert!(!GROK_WAKE_TRIGGER.contains('>'));
         assert_eq!(GROK_WAKE_TRIGGER, "hcom: wake");
     }
