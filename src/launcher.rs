@@ -23,8 +23,9 @@ use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
-    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
-    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
+    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, GROK_REJECTED_ARGS, KILO_REJECTED_ARGS,
+    KIMI_REJECTED_ARGS, OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS,
+    validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -2577,9 +2578,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             ANTIGRAVITY_REJECTED_ARGS,
         ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
-        // Grok accepts -p/--single, --resume, --fork-session, positional prompts;
-        // no hcom-specific rejections yet.
-        LaunchTool::Grok => Vec::new(),
+        LaunchTool::Grok => validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS),
     }
 }
 
@@ -2805,6 +2804,16 @@ mod tests {
         let mut args = vec!["--model".to_string(), "safe-model".to_string()];
         append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "hcom".into()).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("hcom"));
+    }
+
+    #[test]
+    fn validate_grok_rejects_one_shot() {
+        let errors = validate_tool_args(&LaunchTool::Grok, &["-p".to_string(), "task".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("-p") || errors[0].contains("single"));
+        assert!(
+            validate_tool_args(&LaunchTool::Grok, &["--always-approve".to_string()]).is_empty()
+        );
     }
 
     #[test]

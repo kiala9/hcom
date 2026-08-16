@@ -30,6 +30,8 @@ const GROK_HOOK_COMMANDS: &[(&str, &str)] = &[
     ("PreToolUse", "grok-pretooluse"),
     ("PostToolUse", "grok-posttooluse"),
     ("Stop", "grok-stop"),
+    ("SubagentStart", "grok-subagentstart"),
+    ("SubagentStop", "grok-subagentstop"),
     ("SessionEnd", "grok-sessionend"),
 ];
 
@@ -68,7 +70,7 @@ pub enum SetupError {
 }
 
 /// Resolve Grok config root: `$GROK_HOME` if set, else `<tool_config_root>/.grok`.
-fn grok_config_dir() -> PathBuf {
+pub fn grok_config_dir() -> PathBuf {
     if let Ok(home) = std::env::var("GROK_HOME") {
         let trimmed = home.trim();
         if !trimmed.is_empty() {
@@ -99,10 +101,8 @@ fn build_grok_hook_command(command: &str) -> String {
 }
 
 fn is_hcom_grok_command(command: &str) -> bool {
-    let trimmed = command.trim();
-    GROK_HOOK_COMMANDS
-        .iter()
-        .any(|(_, suffix)| trimmed == build_grok_hook_command(suffix))
+    let last = command.split_whitespace().last().unwrap_or("");
+    GROK_HOOK_COMMANDS.iter().any(|(_, suffix)| last == *suffix)
 }
 
 fn expected_command_hook(command: &str) -> Value {
@@ -369,30 +369,6 @@ fn update_position(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload, instan
     instances::update_instance_position(db, instance_name, &updates);
 }
 
-fn grok_session_env(ctx: &HcomContext) -> Value {
-    const KEYS: &[&str] = &[
-        "HCOM_PROCESS_ID",
-        "HCOM_INSTANCE_NAME",
-        "HCOM_TOOL",
-        "HCOM_DIR",
-        "HCOM_LAUNCHED",
-        "HCOM_PTY_MODE",
-        "HCOM_BACKGROUND",
-        "HCOM_LAUNCHED_BY",
-        "HCOM_LAUNCH_BATCH_ID",
-        "HCOM_LAUNCH_EVENT_ID",
-    ];
-    Value::Object(
-        KEYS.iter()
-            .filter_map(|key| {
-                ctx.raw_env
-                    .get(*key)
-                    .map(|value| ((*key).to_string(), Value::String(value.clone())))
-            })
-            .collect(),
-    )
-}
-
 fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
     let instance = resolve_instance(db, ctx, payload)?;
     update_position(db, ctx, payload, &instance.name);
@@ -401,7 +377,7 @@ fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> O
 
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
     let Some(session_id) = resolve_session_id(payload) else {
-        return json!({ "env": grok_session_env(ctx) });
+        return json!({});
     };
     let instance_name = ctx
         .process_id
@@ -409,7 +385,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         .and_then(|pid| instance_binding::bind_session_to_process(db, &session_id, Some(pid)))
         .or_else(|| resolve_instance(db, ctx, payload).map(|instance| instance.name));
     let Some(instance_name) = instance_name else {
-        return json!({ "env": grok_session_env(ctx) });
+        return json!({});
     };
     let _ = db.rebind_instance_session(&instance_name, &session_id);
     instance_binding::capture_and_store_launch_context(db, &instance_name);
@@ -424,9 +400,22 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::runtime_env::set_terminal_title(&instance_name);
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
-    // SessionStart is observe-only on Grok: stdout is not parsed into the model.
-    // Bootstrap must use launch-time channels (--rules / skill), not hook stdout.
-    json!({ "env": grok_session_env(ctx) })
+    // SessionStart is observe-only: stdout discarded. Bootstrap is --rules.
+    json!({})
+}
+
+fn handle_subagentstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
+    if let Some(instance) = resolved_instance(db, ctx, payload) {
+        lifecycle::set_status(
+            db,
+            &instance.name,
+            ST_LISTENING,
+            "subagent-start",
+            Default::default(),
+        );
+        common::notify_hook_instance_with_db(db, &instance.name);
+    }
+    json!({})
 }
 
 fn handle_userpromptsubmit(
@@ -485,47 +474,9 @@ fn handle_posttooluse(
     (json!({}), None)
 }
 
-/// Stop reasons that mean the session/channel is gone — never deliver or ack.
-fn is_session_end_stop(payload: &HookPayload) -> bool {
-    let reason = payload
-        .raw
-        .get("reason")
-        .and_then(Value::as_str)
-        .or_else(|| payload.raw.get("stop_reason").and_then(Value::as_str))
-        .or_else(|| payload.raw.get("stopReason").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        reason.as_str(),
-        "channel_closed"
-            | "shutdown"
-            | "session_end"
-            | "sessionend"
-            | "end_session"
-            | "user_exit"
-            | "exit"
-            | "closed"
-            | "abort"
-    )
-}
-
-fn is_cancellable_stop_status(payload: &HookPayload) -> bool {
-    let status = payload
-        .raw
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    matches!(
-        status,
-        "cancelled" | "canceled" | "error" | "failed" | "aborted"
-    )
-}
-
-/// True when this Stop is a normal end-of-turn that may continue with context.
+/// Grok Stop always sends `reason: "end_turn"`. Empty / completed are accepted
+/// as the same gate. Session teardown is `SessionEnd`, not a Stop reason.
 fn is_genuine_end_turn_stop(payload: &HookPayload) -> bool {
-    if is_session_end_stop(payload) || is_cancellable_stop_status(payload) {
-        return false;
-    }
     let reason = payload
         .raw
         .get("reason")
@@ -534,8 +485,6 @@ fn is_genuine_end_turn_stop(payload: &HookPayload) -> bool {
         .or_else(|| payload.raw.get("stopReason").and_then(Value::as_str))
         .unwrap_or("")
         .to_ascii_lowercase();
-    // Empty / end_turn / completed: allow delivery. Unknown reasons: allow only
-    // when not session-end-like (handled above).
     reason.is_empty()
         || reason == "end_turn"
         || reason == "endturn"
@@ -554,20 +503,6 @@ fn handle_stop(
     lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
 
-    if is_session_end_stop(payload) {
-        log::log_info(
-            "hooks",
-            "grok.stop.session_end_skip",
-            &format!(
-                "instance={} — no deliver/ack on session-end Stop",
-                instance.name
-            ),
-        );
-        return (json!({}), None);
-    }
-    if is_cancellable_stop_status(payload) {
-        return (json!({}), None);
-    }
     if !is_genuine_end_turn_stop(payload) {
         return (json!({}), None);
     }
@@ -651,6 +586,8 @@ pub fn dispatch_grok_hook(hook_name: &str) -> i32 {
             "grok-pretooluse" => (handle_pretooluse(&db, &ctx, &payload), None),
             "grok-posttooluse" => handle_posttooluse(&db, &ctx, &payload),
             "grok-stop" => handle_stop(&db, &ctx, &payload),
+            "grok-subagentstart" => (handle_subagentstart(&db, &ctx, &payload), None),
+            "grok-subagentstop" => handle_stop(&db, &ctx, &payload),
             "grok-sessionend" => (handle_sessionend(&db, &ctx, &payload), None),
             _ => (json!({}), None),
         },
@@ -771,6 +708,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(!all_commands.contains(&"uvx hcom grok-stop"));
         assert!(all_commands.contains(&"./custom-stop.sh"));
     }
 
@@ -844,12 +782,21 @@ mod tests {
     }
 
     #[test]
-    fn session_end_stop_reasons_are_detected() {
-        let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "channel_closed" }));
-        assert!(is_session_end_stop(&payload));
+    fn end_turn_is_the_only_stop_delivery_reason() {
         let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "end_turn" }));
-        assert!(!is_session_end_stop(&payload));
         assert!(is_genuine_end_turn_stop(&payload));
+        let payload = HookPayload::from_grok("grok-stop", json!({}));
+        assert!(is_genuine_end_turn_stop(&payload));
+        let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "channel_closed" }));
+        assert!(!is_genuine_end_turn_stop(&payload));
+    }
+
+    #[test]
+    fn is_hcom_grok_command_matches_prefix_variants() {
+        assert!(is_hcom_grok_command("hcom grok-stop"));
+        assert!(is_hcom_grok_command("uvx hcom grok-stop"));
+        assert!(is_hcom_grok_command("hcom grok-subagentstop"));
+        assert!(!is_hcom_grok_command("./custom-stop.sh"));
     }
 
     #[test]

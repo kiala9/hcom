@@ -1106,17 +1106,13 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
-/// After force-Enter of the short wake sentinel, wait this long for a real
-/// submit signal (UPS `prompt`/`trigger`) before re-sending Enter.
-/// Must not treat `commit_delivery_ack`'s ST_ACTIVE as success.
-///
-/// First-turn Grok hooks bind lazily (~4s). 2000ms × MAX_ENTER_ATTEMPTS (3)
-/// ≈ 6s so a cold start does not expire and double-type `hcom: wake`.
-const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(2000);
+/// Wait this long after the first Enter for UPS (`prompt`/`trigger`) before
+/// a single retry Enter. First-turn hooks bind lazily (~4s).
+const GROK_UPS_WAIT: Duration = Duration::from_secs(4);
+/// If Stop never acks this pending batch, allow one more PTY wake.
+const GROK_AWAIT_STOP: Duration = Duration::from_secs(15);
+const GROK_MAX_ENTER_ATTEMPTS: u32 = 2;
 
-/// True when Grok has actually started a user turn (UPS / stop cycle), not when
-/// we merely acked the bus. `deliver:*` is our own premature-ack context and
-/// must NOT count as submit.
 /// True when we already submitted a wake for this unread batch and must wait
 /// for grok-stop to ack instead of typing another `hcom: wake`.
 fn grok_should_skip_rewake(
@@ -1476,6 +1472,7 @@ pub fn run_delivery_loop(
         // when Stop flips listening (same batch still unread until additionalContext
         // is flushed). Cleared when pending drains or the cursor advances.
         let mut grok_awaiting_stop_at: Option<i64> = None;
+        let mut grok_awaiting_stop_since: Option<Instant> = None;
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
@@ -1568,15 +1565,31 @@ pub fn run_delivery_loop(
                     let has_pending = db.has_pending(&current_name);
                     if !has_pending {
                         grok_awaiting_stop_at = None;
+                        grok_awaiting_stop_since = None;
                     }
-                    if has_pending
+                    let skip_rewake = has_pending
                         && config.tool == "grok"
                         && grok_should_skip_rewake(
                             grok_awaiting_stop_at,
                             db.get_cursor(&current_name),
                             has_pending,
-                        )
-                    {
+                        );
+                    let skip_expired = skip_rewake
+                        && grok_awaiting_stop_since
+                            .is_some_and(|since| since.elapsed() >= GROK_AWAIT_STOP);
+                    if skip_expired {
+                        log_info(
+                            "native",
+                            "delivery.grok_await_stop_timeout",
+                            &format!(
+                                "Stop did not ack pending batch after {:?}; allowing another wake",
+                                GROK_AWAIT_STOP
+                            ),
+                        );
+                        grok_awaiting_stop_at = None;
+                        grok_awaiting_stop_since = None;
+                    }
+                    if skip_rewake && !skip_expired {
                         log_info(
                             "native",
                             "delivery.grok_await_stop",
@@ -1617,6 +1630,7 @@ pub fn run_delivery_loop(
                             &format!("No pending messages for {}", current_name),
                         );
                         grok_awaiting_stop_at = None;
+                        grok_awaiting_stop_since = None;
                         delivery_state = State::Idle;
                         attempt = 0;
                         continue;
@@ -1880,20 +1894,22 @@ pub fn run_delivery_loop(
                                 // notify is for the same unread batch.
                                 if still_pending {
                                     grok_awaiting_stop_at = Some(db.get_cursor(&current_name));
+                                    grok_awaiting_stop_since = Some(Instant::now());
                                 } else {
                                     grok_awaiting_stop_at = None;
+                                    grok_awaiting_stop_since = None;
                                 }
                                 delivery_state = State::Idle;
                                 phase_started_at = Instant::now();
                                 continue;
                             }
 
-                            if elapsed < GROK_SUBMIT_CONFIRM {
+                            if elapsed < GROK_UPS_WAIT {
                                 std::thread::sleep(Duration::from_millis(50));
                                 continue;
                             }
 
-                            if enter_attempt < MAX_ENTER_ATTEMPTS {
+                            if enter_attempt < GROK_MAX_ENTER_ATTEMPTS {
                                 let user_active = state.is_user_active();
                                 let approval =
                                     state.screen.read().map(|s| s.approval).unwrap_or(false);
@@ -1921,7 +1937,7 @@ pub fn run_delivery_loop(
                                         "Grok still pending after {:?}; re-Enter sentinel (attempt={}/{})",
                                         elapsed,
                                         enter_attempt + 1,
-                                        MAX_ENTER_ATTEMPTS,
+                                        GROK_MAX_ENTER_ATTEMPTS,
                                     ),
                                 );
                                 // Single Enter only — double Enter can queue two wakes.
@@ -1935,7 +1951,7 @@ pub fn run_delivery_loop(
                                 "native",
                                 "delivery.grok_wake_unconfirmed",
                                 &format!(
-                                    "Grok wake unconfirmed after {MAX_ENTER_ATTEMPTS} Enters; leaving pending (no force-ack)"
+                                    "Grok wake unconfirmed after {GROK_MAX_ENTER_ATTEMPTS} Enters; leaving pending (no force-ack)"
                                 ),
                             );
                             // Leave messages pending for a later idle cycle.

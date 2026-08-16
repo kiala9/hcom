@@ -320,6 +320,8 @@ const GROK_HOOKS: &[&str] = &[
     "grok-pretooluse",
     "grok-posttooluse",
     "grok-stop",
+    "grok-subagentstart",
+    "grok-subagentstop",
     "grok-sessionend",
 ];
 
@@ -406,11 +408,6 @@ const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
 const GROK_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom grok --model grok-build", "Use a specific model"),
     ("hcom grok --always-approve", "Auto-approve tool executions"),
-    // -p/--single is one-shot scripting; not a persistent hcom-managed agent.
-    (
-        "hcom grok -p \"task\"",
-        "One-shot headless run (exits; not for multi-turn hcom)",
-    ),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -1108,7 +1105,8 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
         // permanently report prompt_has_text and block PTY inject forever.
         require_prompt_empty: false,
         block_on_user_activity: true,
-        block_on_approval: true,
+        // Composer scrape is None; do not pretend we can see Grok approval UI.
+        block_on_approval: false,
         // Launch readiness falls back to settle-timeout without a ready pattern.
         launch_requires_ready: false,
         launch_ready_on_plugin_bind: false,

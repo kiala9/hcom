@@ -1050,9 +1050,8 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
 
 /// Merge grok original launch args with resume args.
 ///
-/// Drop prior session selectors (`--resume`/`--continue`/`--fork-session`/
-/// `--session-id`) and the stale positional task prompt; keep model and
-/// permission flags from the original launch.
+/// Drop session selectors, one-shot flags, and worktree flags (the session
+/// already lives in that tree). `-w`/`--worktree` take an optional value.
 fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
     const VALUE_FLAGS: &[&str] = &[
         "--model",
@@ -1060,24 +1059,16 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
         "--cwd",
         "--rules",
         "--agent",
-        "--session-id",
-        "-s",
         "--permission-mode",
         "--reasoning-effort",
         "--effort",
         "--max-turns",
         "--output-format",
-        "--prompt-file",
-        "--prompt-json",
         "--disallowed-tools",
         "--tools",
         "--allow",
         "--deny",
         "--sandbox",
-        // Preserve worktree / debug / system-prompt values (owner review).
-        "--worktree",
-        "--worktree-ref",
-        "--ref",
         "--leader-socket",
         "--debug-file",
         "--system-prompt-override",
@@ -1091,8 +1082,11 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
         "-p",
         "--prompt-file",
         "--prompt-json",
+        "--worktree",
+        "-w",
+        "--worktree-ref",
+        "--ref",
     ];
-    // Reject one-shot flags on resume of a persistent agent.
     const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session", "--restore-code"];
 
     let is_flag = |t: &str| t.starts_with('-');
@@ -3680,6 +3674,36 @@ mod tests {
         // copilot has fork: None, so build_resume_args returns resume-only args
         let args = build_resume_args("copilot", "sess-abc", true);
         assert_eq!(args, s(&["--resume", "sess-abc"]));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_worktree_and_keeps_rules() {
+        let original = s(&["--worktree", "feat", "--rules", "BOOT", "--always-approve"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.iter().any(|t| t == "--worktree" || t == "feat"));
+        assert!(merged.contains(&"--rules".to_string()));
+        assert!(merged.contains(&"BOOT".to_string()));
+        assert!(merged.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_bare_worktree_does_not_eat_model() {
+        let original = s(&["--worktree", "--model", "grok-build"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.contains(&"--worktree".to_string()));
+        assert!(merged.contains(&"--model".to_string()));
+        assert!(merged.contains(&"grok-build".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_short_worktree_drops_name() {
+        let original = s(&["-w", "mytree", "--always-approve"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.iter().any(|t| t == "-w" || t == "mytree"));
+        assert!(merged.contains(&"--always-approve".to_string()));
     }
 
     #[test]

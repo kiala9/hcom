@@ -1,4 +1,4 @@
-# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code + Pi + OMP + Antigravity + Cursor + Kimi + Copilot
+# Cross-Tool Patterns: Claude + Codex + Gemini + OpenCode + Kilo Code + Pi + OMP + Antigravity + Cursor + Kimi + Copilot + Grok
 
 Verified behavior when mixing different AI coding tools via hcom.
 
@@ -65,6 +65,16 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Status detail**: edit tool is `StrReplace` (not `Edit`); file/edit tools key the path off `path` (not `file_path`); shell has the `run_terminal_cmd` variant; delegates are `Task`/`Subagent`.
 - **Fork**: not supported (cursor-agent has no native branch primitive — only `--resume`/`--continue`); resume preserved.
 - **Transcript**: cursor-agent writes JSONL under `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Parser support is limited: no timestamps, `cwd`, or tool-result blocks; user prompts require wrapper removal.
+
+### Grok Build
+- **Hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop, SessionEnd — native `~/.grok/hooks/hcom.json` (`$GROK_HOME`).
+- **Payload**: JSON via stdin. Observe events discard stdout; only Stop / SubagentStop parse `hookSpecificOutput.additionalContext`.
+- **Bootstrap**: launch `--rules` (system prompt append). SessionStart does not inject bootstrap.
+- **Message delivery**: idle PTY types `hcom: wake` only; the bus body arrives on the next Stop. Do not `hcom listen` for inbound hcom mail.
+- **Composer scrape**: none. Approval UI is not gated (`block_on_approval: false`).
+- **One-shot**: `hcom grok -p` / `--single` is rejected — process exits and cannot stay on the bus.
+- **Resume**: `--resume` / `--fork-session`. Worktree flags from the original launch are not replayed.
+- **Transcript**: `$GROK_HOME/sessions/**/updates.jsonl` (default `~/.grok/sessions`).
 
 ## Working Patterns
 

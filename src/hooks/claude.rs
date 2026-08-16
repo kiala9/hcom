@@ -309,6 +309,13 @@ fn route_claude_hook(
     let dispatch_start = Instant::now();
     let mut timing = DispatchTiming::default();
 
+    // Grok also loads ~/.claude/settings.json. Native grok-* owns lifecycle
+    // and Stop additionalContext; Claude-compat must not write status or ack.
+    if common::is_grok_host() {
+        timing.result = Some("grok_compat_noop");
+        return (0, String::new(), None, timing);
+    }
+
     // Ensure directories and init DB
     if !paths::ensure_hcom_directories() {
         return (0, String::new(), None, timing);
@@ -5086,6 +5093,47 @@ mod tests {
         db.set_session_binding(session_id, instance_name).unwrap();
         db.mark_claude_session_validated(session_id, instance_name)
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn grok_compat_hooks_are_total_noops() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, last_seen, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'grok', 'active', 'prompt', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        unsafe {
+            std::env::set_var("GROK_HOOK_EVENT", "Stop");
+            std::env::remove_var("GROK_HOOK_NAME");
+        }
+        let mut payload = HookPayload::from_claude(serde_json::json!({
+            "session_id": "sess-1",
+        }));
+        let (code, stdout, ack, timing) =
+            route_claude_hook(&db, &make_ctx(), HOOK_POLL, &mut payload);
+        unsafe {
+            std::env::remove_var("GROK_HOOK_EVENT");
+        }
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+        assert_eq!(timing.result, Some("grok_compat_noop"));
+        let (status, context): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context FROM instances WHERE name = 'nova'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(context, "prompt");
     }
 
     #[test]
