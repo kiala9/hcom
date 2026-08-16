@@ -335,6 +335,60 @@ fn apply_inherited_notes(instance_env: &mut HashMap<String, String>, inherited: 
     }
 }
 
+fn build_grok_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+    tag: &str,
+    relay_enabled: bool,
+) -> String {
+    let notes = instance_env
+        .get("HCOM_NOTES")
+        .map(String::as_str)
+        .unwrap_or("");
+    crate::bootstrap::get_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "grok",
+        background,
+        true,
+        notes,
+        tag,
+        relay_enabled,
+        None,
+    )
+}
+
+/// Append hcom bootstrap onto grok `--rules` (launch-time system-prompt channel).
+/// Grok observe-hooks discard stdout, so this is the only bootstrap path.
+fn inject_grok_rules(args: &mut Vec<String>, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let token = &args[i];
+        if token == "--rules" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                args[i + 1] = format!("{}\n\n{}", extra, args[i + 1]);
+            } else {
+                args.insert(i + 1, extra.to_string());
+            }
+            return;
+        }
+        if let Some(rest) = token.strip_prefix("--rules=") {
+            args[i] = format!("--rules={}\n\n{}", extra, rest);
+            return;
+        }
+        i += 1;
+    }
+    args.insert(0, "--rules".to_string());
+    args.insert(1, extra.to_string());
+}
+
 fn build_codex_bootstrap(
     db: &HcomDb,
     hcom_dir: &Path,
@@ -2382,13 +2436,30 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     )
                 }
                 LaunchTool::Grok => {
+                    // Observe-only SessionStart cannot deliver bootstrap. Inject
+                    // via grok `--rules` (appended to the system prompt) and mark
+                    // announced so hooks do not try a discarded-stdout fallback.
+                    let bootstrap = build_grok_bootstrap(
+                        db,
+                        &paths::hcom_dir(),
+                        &instance_name,
+                        params.background,
+                        &instance_env,
+                        &effective_tag,
+                        hcom_config.relay_enabled,
+                    );
+                    let mut grok_args = params.args.clone();
+                    inject_grok_rules(&mut grok_args, &bootstrap);
+                    if let Some(ref sp) = params.system_prompt {
+                        inject_grok_rules(&mut grok_args, sp);
+                    }
                     instances::update_instance_position(
                         db,
                         &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
+                        &serde_json::Map::from_iter([
+                            ("launch_args".to_string(), json!(&stored_launch_args)),
+                            ("name_announced".to_string(), json!(true)),
+                        ]),
                     );
                     launch_pty_or_background(
                         &mut BackgroundLaunchCtx {
@@ -2403,7 +2474,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             handles: &mut handles,
                         },
                         &mut instance_env,
-                        &params.args,
+                        &grok_args,
                         &params,
                         inside_ai_tool,
                     )
@@ -3170,6 +3241,50 @@ mod tests {
         assert_eq!(env.get("HCOM_TAG").map(String::as_str), Some("config-tag"));
 
         unsafe { std::env::remove_var("HCOM_TAG") }
+    }
+
+    #[test]
+    fn test_inject_grok_rules_prepends_when_absent() {
+        let mut args = vec!["--always-approve".to_string()];
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(
+            args,
+            vec![
+                "--rules".to_string(),
+                "BOOT".to_string(),
+                "--always-approve".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inject_grok_rules_prefixes_existing_value() {
+        let mut args = vec!["--rules".to_string(), "user-rules".to_string()];
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(args[0], "--rules");
+        assert!(args[1].starts_with("BOOT"));
+        assert!(args[1].contains("user-rules"));
+    }
+
+    #[test]
+    fn test_grok_bootstrap_describes_hcom_wake_sentinel() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let bootstrap = build_grok_bootstrap(
+            &db,
+            hcom_dir.path(),
+            "kumo",
+            true,
+            &HashMap::new(),
+            "reviewfix",
+            false,
+        );
+        assert!(bootstrap.contains("HCOM SESSION") || bootstrap.contains("[HCOM SESSION]"));
+        assert!(bootstrap.contains("hcom: wake"));
+        assert!(
+            !bootstrap.contains("only `<hcom>` is a wake trigger"),
+            "GROK_DELIVERY must not describe the Cursor/Copilot sentinel: {bootstrap}"
+        );
     }
 
     #[test]

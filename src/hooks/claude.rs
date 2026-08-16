@@ -1679,6 +1679,12 @@ fn handle_permission_denied(
 }
 
 fn handle_stop_failure(db: &HcomDb, payload: &HookPayload, instance_name: &str) -> (i32, String) {
+    // Grok loads Claude-compat StopFailure too. After rate-limit / API errors it
+    // sits on a modal and stops emitting hooks, so ST_INACTIVE here is terminal
+    // (alive process, no snapshot, `hcom r` fails). Native grok-stop owns status.
+    if common::is_grok_host() {
+        return (0, String::new());
+    }
     let error = payload
         .raw
         .get("error")

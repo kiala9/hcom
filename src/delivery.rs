@@ -1106,15 +1106,13 @@ pub(crate) fn inject_text(port: u16, text: &str) -> bool {
     }
 }
 
-/// How long to wait after a Grok full-body inject before force-Enter.
+/// After force-Enter of the short wake sentinel, wait this long for a real
+/// submit signal (UPS `prompt`/`trigger`) before re-sending Enter.
+/// Must not treat `commit_delivery_ack`'s ST_ACTIVE as success.
 ///
-/// Scales with payload size: short pings stay snappy; large review dumps under
-/// slow WSL/GB get up to ~4s so the composer can finish accepting paste.
-/// After force-Enter, how long to wait for a *real* submit signal before
-/// re-sending Enter. Must not treat `commit_delivery_ack`'s ST_ACTIVE as success
-/// (that was a false positive that skipped retries while the composer still
-/// held unsent text).
-const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(1200);
+/// First-turn Grok hooks bind lazily (~4s). 2000ms × MAX_ENTER_ATTEMPTS (3)
+/// ≈ 6s so a cold start does not expire and double-type `hcom: wake`.
+const GROK_SUBMIT_CONFIRM: Duration = Duration::from_millis(2000);
 
 /// True when Grok has actually started a user turn (UPS / stop cycle), not when
 /// we merely acked the bus. `deliver:*` is our own premature-ack context and

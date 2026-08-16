@@ -853,19 +853,59 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stop_output_uses_additional_context_not_followup() {
-        // Schema smoke: Stop payload shape for Grok StopHookJson.
-        let body = "hello from bus";
-        let out = json!({
-            "hookSpecificOutput": {
-                "additionalContext": body,
-                "additional_context": body,
-            }
-        });
-        assert!(out.get("followup_message").is_none());
-        assert_eq!(
-            out["hookSpecificOutput"]["additionalContext"].as_str(),
-            Some(body)
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().expect("db");
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'grok', 'listening', '', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-nova", "sess-1", "nova")
+            .unwrap();
+        let data = json!({
+            "from": "luna",
+            "text": "hello from bus",
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:01Z', 'luna', ?1)",
+                rusqlite::params![data],
+            )
+            .unwrap();
+
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        env.insert("HCOM_PROCESS_ID".into(), "proc-nova".into());
+        env.insert("HCOM_LAUNCHED".into(), "1".into());
+        env.insert("HCOM_DIR".into(), hcom_dir.to_string_lossy().into_owned());
+        let ctx = crate::shared::context::HcomContext::from_env(
+            &env,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         );
+        let payload = HookPayload::from_grok("grok-stop", json!({ "reason": "end_turn" }));
+        let (out, ack) = handle_stop(&db, &ctx, &payload);
+
+        assert!(
+            out.get("followup_message").is_none(),
+            "Stop must not emit followup_message: {out}"
+        );
+        let body = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            body.contains("hello from bus"),
+            "expected additionalContext to carry the bus body, got {out}"
+        );
+        assert!(
+            out["hookSpecificOutput"]["additional_context"]
+                .as_str()
+                .is_some_and(|s| s.contains("hello from bus"))
+        );
+        assert!(ack.is_some());
     }
 }
